@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Correlation Matrix Viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+<style>
+  body { font-family: 'Inter', sans-serif; background:#f5f7fa; margin:0; padding:2rem; color:#111; }
+  h1 { text-align:center; }
+  .container { max-width:1100px; margin:0 auto; background:white; padding:1.5rem; border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,0.08);} 
+  label{display:block;font-weight:600;margin-top:0.5rem}
+  input { padding:0.5rem 0.75rem; border:1px solid #ddd; border-radius:6px; box-sizing:border-box; height:2.5rem; width:100%; }
+  button{background:linear-gradient(90deg,#f97316,#4f46e5);border:none;padding:8px 14px;border-radius:10px;color:white;font-weight:600;cursor:pointer}
+  .stocks-list{margin-top:1rem}
+  .stock-item{display:flex;align-items:center;gap:0.5rem;padding:0.4rem;border-radius:6px}
+  .stock-item button{background:#ef4444;color:white;border:none;padding:4px 8px;border-radius:6px;cursor:pointer}
+  .autocomplete-suggestions{border:1px solid #ccc;max-height:200px;overflow:auto;background:white;position:absolute;z-index:1000;width:100%}
+  .autocomplete-suggestion{padding:0.5rem;cursor:pointer}
+  .autocomplete-suggestion:hover{background:#f0f0f0}
+  .corr-table-wrap{overflow:auto; border:1px solid #e6e6e6; padding:0.5rem; border-radius:8px; background:#fff; margin-top:1.5rem; }
+  table.corr-table { border-collapse:collapse; width:100%; min-width:420px; }
+  table.corr-table th, table.corr-table td { padding:6px 8px; text-align:center; border:1px solid rgba(0,0,0,0.05); font-size:13px; }
+  table.corr-table th { background:#fafafa; position:sticky; top:0; z-index:1; }
+  .disclaimer {margin-top:1rem; font-size:0.9rem; color:#666; font-style:italic;}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Correlation Matrix Calculator</h1>
+
+<!-- STOCK SEARCH -->
+<div style="position:relative;">
+  <label>Search stock (name or ticker)</label>
+  <input id="stockSearch" placeholder="Type company name or ticker" />
+  <div id="searchSuggestions" class="autocomplete-suggestions"></div>
+  <div style="margin-top:0.5rem;color:#666">Selected stocks (click remove to delete)</div>
+  <div class="stocks-list" id="stocksList"></div>
+
+<!-- TIME HORIZON INPUT -->
+<div style="margin-top:1rem; max-width:200px;">
+  <label>Correlation Horizon (days)</label>
+  <input id="horizonInput" type="number" min="10" value="365" />
+</div>
+</div>
+
+<div class="corr-table-wrap" id="corrTableWrap" style="display:none;"></div>
+
+<div class="disclaimer">⚠️ Note: The backend server may take up to 30 seconds to wake up after inactivity.</div>
+</div>
+
+<script>
+const proxyURL = 'https://jointdefault.onrender.com';
+let selected = [];
+const maxStocks = 30;
+
+async function fetchSuggestions(query){
+  if(!query) return [];
+  try {
+    const response = await axios.get(`${proxyURL}/api/autocomplete`, { params:{ query } });
+    return Array.isArray(response.data) ? response.data : [];
+  } catch(e){
+    console.error(e);
+    return [];
+  }
+}
+
+// Autocomplete
+let debounce;
+const searchInput = document.getElementById('stockSearch');
+const suggestionsDiv = document.getElementById('searchSuggestions');
+
+searchInput.addEventListener('input',()=>{
+  clearTimeout(debounce);
+  debounce = setTimeout(async ()=>{
+    const q = searchInput.value.trim();
+    suggestionsDiv.innerHTML='';
+    if(!q) return;
+    const list = await fetchSuggestions(q);
+    list.slice(0,10).forEach(item=>{
+      const d = document.createElement('div');
+      d.className='autocomplete-suggestion';
+      d.innerText = `${item.name||item.symbol} (${item.symbol})`;
+      d.onclick = ()=>{ addStock(item.symbol); searchInput.value=''; suggestionsDiv.innerHTML=''; };
+      suggestionsDiv.appendChild(d);
+    });
+  },300);
+});
+
+function addStock(symbol){
+  if(selected.length >= maxStocks) return alert('Maximum stocks reached');
+  if(selected.includes(symbol)) return alert('Already added');
+  selected.push(symbol);
+  renderSelected();
+  updateCorrelationMatrix();
+}
+
+function renderSelected(){
+  const c = document.getElementById('stocksList');
+  c.innerHTML='';
+  selected.forEach(sym=>{
+    const row = document.createElement('div');
+    row.className='stock-item';
+    row.innerHTML = `<strong style='width:120px'>${sym}</strong>`;
+    const btn=document.createElement('button');
+    btn.innerText='Remove';
+    btn.onclick=()=>{ selected = selected.filter(s=>s!==sym); renderSelected(); updateCorrelationMatrix(); };
+    row.appendChild(btn);
+    c.appendChild(row);
+  });
+}
+
+async function fetchPrices(){
+  if(!selected.length) return null;
+  try{
+    const resp = await axios.get(`${proxyURL}/api/batch`, { params:{ tickers:selected.join(','), days: document.getElementById('horizonInput').value || 365 } });
+    return resp.data;
+  } catch(err){ console.error(err); return null; }
+}
+
+function calcReturns(prices){
+  return prices.map(series=>{
+    const r=[];
+    for(let i=1;i<series.length;i++) r.push((series[i]-series[i-1])/series[i-1]);
+    return r;
+  });
+}
+
+function mean(a){ return a.reduce((x,y)=>x+y,0)/a.length; }
+
+function corrMatrix(returns){
+  const n = returns.length;
+  const corr = Array(n).fill(null).map(()=>Array(n).fill(0));
+  const means = returns.map(mean);
+  const sd = returns.map(r=>Math.sqrt(mean(r.map(x=>(x-mean(r))**2))));
+
+  for(let i=0;i<n;i++){
+    for(let j=0;j<n;j++){
+      let cov=0;
+      for(let k=0;k<returns[i].length;k++) cov += (returns[i][k]-means[i])*(returns[j][k]-means[j]);
+      cov /= (returns[i].length-1);
+      corr[i][j] = cov/(sd[i]*sd[j]);
+    }
+  }
+  return corr;
+}
+
+async function updateCorrelationMatrix(){
+  const wrap = document.getElementById('corrTableWrap');
+  if(selected.length === 0){ wrap.style.display='none'; wrap.innerHTML=''; return; }
+
+  const data = await fetchPrices();
+  if(!data) return;
+
+  const prices = data.map(d=>d.close);
+  const returns = calcReturns(prices);
+  const matrix = corrMatrix(returns);
+
+  let html = `<table class='corr-table'><tr><th></th>`;
+  selected.forEach(s=> html += `<th>${s}</th>`);
+  html += `</tr>`;
+
+  matrix.forEach((row,i)=>{
+    html += `<tr><th>${selected[i]}</th>`;
+    row.forEach(v=>{
+      const col = v;
+      const color = col > 0.6 ? '#d1fae5' : col < -0.6 ? '#fee2e2' : '#fff';
+      html += `<td style='background:${color}'>${col.toFixed(2)}</td>`;
+    });
+    html += `</tr>`;
+  });
+
+  html += `</table>`;
+  wrap.innerHTML = html;
+  wrap.style.display = 'block';
+}
+  </script>
+  <footer style="margin:40px auto 20px;max-width:920px;text-align:center;font-size:12px;color:#777;font-style:italic;">
+    © Quantik.org. All rights reserved. This model, including its code and associated intellectual property, is the exclusive property of Quantik.org and may not be copied, distributed, or replicated without prior written consent. Use of this calculator implies acceptance of these terms.
+  </footer>
+</body>
+</html>
